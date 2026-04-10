@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const QUEUE_DIR: &str = "/tmp/revolver-queue";
+const LOCK_DIR: &str = "/tmp/revolver-lock";
+const LOCK_TTL_SECS: u64 = 10;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 // --- terminal width via ioctl ---
@@ -96,6 +98,40 @@ fn queue_position(my_file: &Path) -> usize {
     entries.iter().position(|e| e == &my_name).unwrap_or(0)
 }
 
+// --- GPU locking ---
+
+fn lock_gpu(idx: u32) {
+    let _ = fs::create_dir_all(LOCK_DIR);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = Path::new(LOCK_DIR).join(idx.to_string());
+    fs::write(&path, nanos.to_string()).expect("failed to write GPU lock file");
+}
+
+fn is_gpu_locked(idx: u32) -> bool {
+    let path = Path::new(LOCK_DIR).join(idx.to_string());
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            if let Ok(lock_nanos) = contents.trim().parse::<u128>() {
+                let now_nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let age_secs = (now_nanos.saturating_sub(lock_nanos)) / 1_000_000_000;
+                if age_secs < LOCK_TTL_SECS as u128 {
+                    return true;
+                }
+                // Stale lock, clean up
+                let _ = fs::remove_file(&path);
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 // --- GPU queries ---
 
 fn query_gpu_indices() -> Vec<(u32, String)> {
@@ -139,7 +175,7 @@ fn find_free_gpu() -> Result<u32, usize> {
     let mut free = Vec::new();
 
     for (idx, bus_id) in &gpus {
-        if busy.contains(bus_id) {
+        if busy.contains(bus_id) || is_gpu_locked(*idx) {
             busy_count += 1;
         } else {
             free.push(*idx);
@@ -194,6 +230,7 @@ fn main() {
     let pos = queue_position(&queue_file);
     if pos == 0 {
         if let Ok(idx) = find_free_gpu() {
+            lock_gpu(idx);
             queue_leave(&queue_file);
             println!("{}", idx);
             return;
@@ -216,6 +253,7 @@ fn main() {
             last_pos = queue_position(&queue_file);
             match find_free_gpu() {
                 Ok(idx) if last_pos == 0 => {
+                    lock_gpu(idx);
                     let mut err = stderr.lock();
                     let _ = write!(err, "\r\x1b[2K");
                     let _ = err.flush();
