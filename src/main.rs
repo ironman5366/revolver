@@ -49,7 +49,7 @@ unsafe fn libc_ioctl(fd: i32, request: u64, arg: *mut libc_winsize) -> i32 {
 
 // --- queue management ---
 
-fn queue_join() -> PathBuf {
+fn queue_join(requested: usize) -> PathBuf {
     let _ = fs::create_dir_all(QUEUE_DIR);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,7 +57,7 @@ fn queue_join() -> PathBuf {
         .as_nanos();
     let pid = process::id();
     let path = Path::new(QUEUE_DIR).join(format!("{}.{}", nanos, pid));
-    fs::write(&path, "").expect("failed to create queue file");
+    fs::write(&path, requested.to_string()).expect("failed to create queue file");
     path
 }
 
@@ -100,14 +100,16 @@ fn queue_position(my_file: &Path) -> usize {
 
 // --- GPU locking ---
 
-fn lock_gpu(idx: u32) {
+fn lock_gpus(indices: &[u32]) {
     let _ = fs::create_dir_all(LOCK_DIR);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = Path::new(LOCK_DIR).join(idx.to_string());
-    fs::write(&path, nanos.to_string()).expect("failed to write GPU lock file");
+    for &idx in indices {
+        let path = Path::new(LOCK_DIR).join(idx.to_string());
+        fs::write(&path, nanos.to_string()).expect("failed to write GPU lock file");
+    }
 }
 
 fn is_gpu_locked(idx: u32) -> bool {
@@ -167,25 +169,27 @@ fn busy_bus_ids() -> HashSet<String> {
     stdout.lines().map(|l| l.trim().to_string()).collect()
 }
 
-fn find_free_gpu() -> Result<u32, usize> {
+fn find_free_gpus(n: usize) -> Result<Vec<u32>, (usize, usize)> {
     let gpus = query_gpu_indices();
     let busy = busy_bus_ids();
+    let total = gpus.len();
 
-    let mut busy_count = 0;
     let mut free = Vec::new();
 
     for (idx, bus_id) in &gpus {
         if busy.contains(bus_id) || is_gpu_locked(*idx) {
-            busy_count += 1;
+            // busy
         } else {
             free.push(*idx);
         }
     }
 
-    if let Some(&gpu) = free.iter().min() {
-        Ok(gpu)
+    free.sort();
+
+    if free.len() >= n {
+        Ok(free[..n].to_vec())
     } else {
-        Err(busy_count)
+        Err((free.len(), total))
     }
 }
 
@@ -223,16 +227,44 @@ fn register_signal_handlers(path: &Path) {
 // --- main ---
 
 fn main() {
-    let queue_file = queue_join();
+    let requested: usize = match std::env::args().nth(1) {
+        None => 1,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                eprintln!("usage: revolver [N]  (N = number of GPUs, default 1)");
+                process::exit(1);
+            }
+        },
+    };
+
+    let total_gpus = query_gpu_indices().len();
+    if requested > total_gpus {
+        eprintln!(
+            "error: requested {} GPUs but only {} available",
+            requested, total_gpus
+        );
+        process::exit(1);
+    }
+
+    let queue_file = queue_join(requested);
     register_signal_handlers(&queue_file);
 
-    // Fast path: we're first in queue and a GPU is free
+    let format_output = |indices: &[u32]| -> String {
+        indices
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    // Fast path: we're first in queue and enough GPUs are free
     let pos = queue_position(&queue_file);
     if pos == 0 {
-        if let Ok(idx) = find_free_gpu() {
-            lock_gpu(idx);
+        if let Ok(indices) = find_free_gpus(requested) {
+            lock_gpus(&indices);
             queue_leave(&queue_file);
-            println!("{}", idx);
+            println!("{}", format_output(&indices));
             return;
         }
     }
@@ -241,7 +273,8 @@ fn main() {
     let start = Instant::now();
     let mut tick: usize = 0;
     let stderr = io::stderr();
-    let mut last_busy_count: usize = 0;
+    let mut last_free_count: usize = 0;
+    let mut last_total_count: usize = total_gpus;
     let mut last_pos: usize = pos;
 
     loop {
@@ -251,31 +284,46 @@ fn main() {
         // Poll every 2s
         if tick % 10 == 0 {
             last_pos = queue_position(&queue_file);
-            match find_free_gpu() {
-                Ok(idx) if last_pos == 0 => {
-                    lock_gpu(idx);
+            match find_free_gpus(requested) {
+                Ok(indices) if last_pos == 0 => {
+                    lock_gpus(&indices);
                     let mut err = stderr.lock();
                     let _ = write!(err, "\r\x1b[2K");
                     let _ = err.flush();
                     queue_leave(&queue_file);
-                    println!("{}", idx);
+                    println!("{}", format_output(&indices));
                     return;
                 }
-                Ok(_) => {} // GPU free but not our turn
-                Err(busy) => last_busy_count = busy,
+                Ok(_) => {} // GPUs free but not our turn
+                Err((free, total)) => {
+                    last_free_count = free;
+                    last_total_count = total;
+                }
             }
         }
 
         let spinner = SPINNER[tick % SPINNER.len()];
         let elapsed = format_elapsed(start.elapsed());
 
-        let line = format!(
-            "{} #{} in queue, all {} GPUs busy [{}]",
-            spinner,
-            last_pos + 1,
-            last_busy_count,
-            elapsed,
-        );
+        let line = if requested == 1 {
+            format!(
+                "{} #{} in queue, all {} GPUs busy [{}]",
+                spinner,
+                last_pos + 1,
+                last_total_count,
+                elapsed,
+            )
+        } else {
+            format!(
+                "{} #{} in queue, need {} GPUs but only {} of {} free [{}]",
+                spinner,
+                last_pos + 1,
+                requested,
+                last_free_count,
+                last_total_count,
+                elapsed,
+            )
+        };
         let width = term_width();
         let truncated: String = line.chars().take(width).collect();
 
